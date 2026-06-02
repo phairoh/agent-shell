@@ -1835,6 +1835,24 @@ COMMAND, when present, may be a shell command string or an argv vector."
                       (when-let* ((diff (agent-shell--make-diff-info
                                          :acp-tool-call (map-nested-elt acp-notification '(params update)))))
                         (list (cons :diff diff)))))
+             ;; OpenCode sends tool_call_update with the populated rawInput
+             ;; after session/request_permission, so an open permission
+             ;; dialog needs a re-render to surface the arguments.
+             ;; See https://github.com/xenodium/agent-shell/issues/617
+             (when-let* ((tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
+                         (tool-call (map-nested-elt state (list :tool-calls tool-call-id)))
+                         ((map-elt tool-call :permission-request-id)))
+               (agent-shell--update-fragment
+                :state state
+                :block-id (format "permission-%s" tool-call-id)
+                :body (with-current-buffer (map-elt state :buffer)
+                        (agent-shell--make-tool-call-permission-text
+                         :tool-call tool-call
+                         :tool-call-id tool-call-id
+                         :client (map-elt state :client)
+                         :state state))
+                :expanded t
+                :navigation 'never))
              (agent-shell--cancel-idle-timer)
              (agent-shell--emit-event
               :event 'tool-call-update
@@ -1984,7 +2002,11 @@ COMMAND, when present, may be a shell command string or an argv vector."
           (append (list (cons :title (map-nested-elt acp-request '(params toolCall title)))
                         (cons :status (map-nested-elt acp-request '(params toolCall status)))
                         (cons :kind (map-nested-elt acp-request '(params toolCall kind)))
-                        (cons :permission-request-id (map-elt acp-request 'id)))
+                        (cons :permission-request-id (map-elt acp-request 'id))
+                        (cons :permission-actions (agent-shell--make-permission-actions
+                                                   (map-nested-elt acp-request '(params options)))))
+                  (when-let* ((raw-input (map-nested-elt acp-request '(params toolCall rawInput))))
+                    (list (cons :raw-input raw-input)))
                   (when-let* ((diff (agent-shell--make-diff-info
                                      :acp-tool-call (map-nested-elt acp-request '(params toolCall)))))
                     (list (cons :diff diff)))))
@@ -2018,7 +2040,8 @@ COMMAND, when present, may be a shell command string or an argv vector."
               :block-id (format "permission-%s" tool-call-id)
               :body (with-current-buffer (map-elt state :buffer)
                       (agent-shell--make-tool-call-permission-text
-                       :acp-request acp-request
+                       :tool-call (map-nested-elt state (list :tool-calls tool-call-id))
+                       :tool-call-id tool-call-id
                        :client (map-elt state :client)
                        :state state))
               :expanded t
@@ -5950,26 +5973,27 @@ for details."
 
 ;;; Permissions
 
-(cl-defun agent-shell--permission-title (&key acp-request)
-  "Build a display title for a permission request from ACP-REQUEST.
+(cl-defun agent-shell--permission-title (&key tool-call)
+  "Build a display title for a permission dialog from TOOL-CALL.
 
-Extracts the tool call title, command, and filepath from ACP-REQUEST
+Extracts the tool call title, command, and filepath from TOOL-CALL
 and combines them into a user-facing string.
 
 For example:
 
-  ACP-REQUEST with title \"edit\" and filepath \"/home/user/foo.rs\"
+  TOOL-CALL with title \"edit\" and filepath \"/home/user/foo.rs\"
   => \"edit (foo.rs)\"
 
-  ACP-REQUEST with title \"Bash\" and command \"ls -la\"
+  TOOL-CALL with title \"Bash\" and command \"ls -la\"
   => \"```console\\nls -la\\n```\""
-  (let* ((title (map-nested-elt acp-request '(params toolCall title)))
+  (let* ((title (map-elt tool-call :title))
+         (raw-input (map-elt tool-call :raw-input))
          (command (agent-shell--tool-call-command-to-string
-                   (map-nested-elt acp-request '(params toolCall rawInput command))))
-         (filepath (or (map-nested-elt acp-request '(params toolCall rawInput filepath))
-                       (map-nested-elt acp-request '(params toolCall rawInput fileName))
-                       (map-nested-elt acp-request '(params toolCall rawInput path))
-                       (map-nested-elt acp-request '(params toolCall rawInput file_path))))
+                   (map-elt raw-input 'command)))
+         (filepath (or (map-elt raw-input 'filepath)
+                       (map-elt raw-input 'fileName)
+                       (map-elt raw-input 'path)
+                       (map-elt raw-input 'file_path)))
          ;; Some agents don't include the command in the
          ;; permission/tool call title, so it's hard to know
          ;; what the permission is actually allowing.
@@ -5995,12 +6019,15 @@ For example:
     ;; renders them verbatim, not as markdown.
     (if (and text
              (equal text command)
-             (equal (map-nested-elt acp-request '(params toolCall kind)) "execute"))
+             (equal (map-elt tool-call :kind) "execute"))
         (concat "```console\n" text "\n```")
       text)))
 
-(cl-defun agent-shell--make-tool-call-permission-text (&key acp-request client state)
-  "Create text to render permission dialog using ACP-REQUEST, CLIENT, and STATE.
+(cl-defun agent-shell--make-tool-call-permission-text (&key tool-call tool-call-id client state)
+  "Create text to render permission dialog for TOOL-CALL.
+
+TOOL-CALL is the saved tool-call alist; TOOL-CALL-ID identifies it
+within STATE.  CLIENT is the ACP client used to send the response.
 
 For example:
 
@@ -6014,9 +6041,7 @@ For example:
 
 
    ╰─"
-  (let* ((tool-call-id (map-nested-elt acp-request '(params toolCall toolCallId)))
-         (diff (map-nested-elt state `(:tool-calls ,tool-call-id :diff)))
-         (actions (agent-shell--make-permission-actions (map-nested-elt acp-request '(params options))))
+  (let* ((actions (map-elt tool-call :permission-actions))
          (shell-buffer (map-elt state :buffer))
          (keymap (let ((map (make-sparse-keymap)))
                    (dolist (action actions)
@@ -6026,7 +6051,7 @@ For example:
                                      (interactive)
                                      (agent-shell--send-permission-response
                                       :client client
-                                      :request-id (map-elt acp-request 'id)
+                                      :request-id (map-elt tool-call :permission-request-id)
                                       :option-id (map-elt action :option-id)
                                       :state state
                                       :tool-call-id tool-call-id
@@ -6039,12 +6064,12 @@ For example:
                                        (with-current-buffer shell-buffer
                                          (agent-shell-interrupt t)))))))
                    ;; Add diff keybinding if diff info is available
-                   (when diff
+                   (when (map-elt tool-call :diff)
                      (define-key map "v" (agent-shell--make-diff-viewing-function
-                                          :diff diff
+                                          :diff (map-elt tool-call :diff)
                                           :actions actions
                                           :client client
-                                          :request-id (map-elt acp-request 'id)
+                                          :request-id (map-elt tool-call :permission-request-id)
                                           :state state
                                           :tool-call-id tool-call-id)))
                    ;; Add interrupt keybinding
@@ -6054,16 +6079,16 @@ For example:
                                  (with-current-buffer shell-buffer
                                    (agent-shell-interrupt t))))
                    map))
-         (title (agent-shell--permission-title :acp-request acp-request))
-         (diff-button (when diff
+         (title (agent-shell--permission-title :tool-call tool-call))
+         (diff-button (when (map-elt tool-call :diff)
                         (agent-shell--make-permission-button
                          :text "View (v)"
                          :help "Press v to view diff"
                          :action (agent-shell--make-diff-viewing-function
-                                  :diff diff
+                                  :diff (map-elt tool-call :diff)
                                   :actions actions
                                   :client client
-                                  :request-id (map-elt acp-request 'id)
+                                  :request-id (map-elt tool-call :permission-request-id)
                                   :state state
                                   :tool-call-id tool-call-id)
                          :keymap keymap
@@ -6100,7 +6125,7 @@ For example:
                                     (interactive)
                                     (agent-shell--send-permission-response
                                      :client client
-                                     :request-id (map-elt acp-request 'id)
+                                     :request-id (map-elt tool-call :permission-request-id)
                                      :option-id (map-elt action :option-id)
                                      :state state
                                      :tool-call-id tool-call-id
