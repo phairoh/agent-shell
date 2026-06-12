@@ -35,6 +35,9 @@ With agent-shell, you can chat with the likes of Gemini CLI, Claude Agent, Auggi
 
 * News
 
+Do take a look at all these blog posts as they showcase most =agent-shell= features.
+
+- [[https://xenodium.com/agent-shell-0-55-updates][agent-shell 0.55 updates]].
 - [[https://xenodium.com/agent-shell-0-47-1-updates][agent-shell 0.47 updates]].
 - [[https://xenodium.com/agent-shell-0-25-updates][agent-shell 0.25 updates]].
 - [[https://xenodium.com/agent-shell-016-improvements-melpa][agent-shell 0.17 improvements + MELPA]].
